@@ -4,7 +4,6 @@ const puppeteer = require("puppeteer");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow your Firebase app to call this server
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -13,7 +12,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reuse a single browser instance for speed
 let browser = null;
 async function getBrowser() {
   if (!browser || !browser.connected) {
@@ -27,82 +25,90 @@ async function getBrowser() {
         "--no-first-run",
         "--no-zygote",
         "--single-process",
+        "--disable-blink-features=AutomationControlled",
       ],
     });
   }
   return browser;
 }
 
-// ── CONTENT SELECTORS (ordered by specificity) ────────────────────────────
+const NOISE_SELECTORS = [
+  "script", "style", "nav", "header", "footer", "aside",
+  "[class*=comment]", "[class*=sidebar]", "[class*=ad]",
+  "[id*=ad]", "[class*=menu]", "[class*=widget]",
+  ".chapter-nav", ".navigation", "[class*=related]",
+  ".rate-bar", ".report", ".chapter-warning",
+];
+
 const CONTENT_SELECTORS = [
+  "#chapter-container",
+  "#chapter-body",
+  ".chapter-body",
+  "#chr-content",
+  ".chr-content",
   ".chapter-content",
+  ".reading-content",
   ".entry-content",
   ".post-content",
   "#chapter-content",
   ".text-left",
-  "[class*=chapter]",
+  "article .content",
   "article",
   "main .content",
-  ".reading-content",
   "#content",
   ".prose",
   "main",
 ];
 
 const TITLE_SELECTORS = [
-  ".chapter-title",
-  "#chapter-title",
-  "h1.entry-title",
-  ".entry-title",
-  "h1.post-title",
-  ".post-title",
-  "h1",
-  "h2",
+  ".chapter-title", "#chapter-title", "h1.entry-title",
+  ".entry-title", "h1.post-title", ".post-title", "h1", "h2",
 ];
 
-const NOISE_SELECTORS = [
-  "script", "style", "nav", "header", "footer", "aside",
-  "[class*=comment]", "[class*=sidebar]", "[class*=ad]",
-  "[id*=ad]", "[class*=menu]", "[class*=widget]",
-  ".chapter-nav", ".navigation", "[class*=related]",
-];
+async function fetchPage(url) {
+  const b = await getBrowser();
+  const page = await b.newPage();
 
-// ── MAIN FETCH ENDPOINT ───────────────────────────────────────────────────
-// GET /fetch?url=https://novelfire.net/book/.../chapter-5
-app.get("/fetch", async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
-
-  let page = null;
   try {
-    const b = await getBrowser();
-    page = await b.newPage();
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    });
 
-    // Look like a real browser
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
     await page.setExtraHTTPHeaders({
       "Accept-Language": "en-US,en;q=0.9",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     });
 
-    // Navigate and wait for the page to settle
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // Wait a beat for any JS-rendered content
-    await new Promise((r) => setTimeout(r, 1500));
+    // Wait for any content selector to have real text
+    try {
+      await page.waitForFunction(
+        (sels) => sels.some((s) => {
+          const el = document.querySelector(s);
+          return el && (el.innerText || el.textContent || "").trim().length > 200;
+        }),
+        { timeout: 10000 },
+        CONTENT_SELECTORS
+      );
+    } catch (_) {}
 
-    // Extract title + content inside the page context
+    await new Promise((r) => setTimeout(r, 2000));
+
     const result = await page.evaluate(
       ({ noiseSels, titleSels, contentSels }) => {
-        // Remove noise
+        const foundSels = contentSels.filter(s => {
+          const el = document.querySelector(s);
+          return el && (el.innerText || el.textContent || "").trim().length > 50;
+        });
+
         noiseSels.forEach((sel) => {
           document.querySelectorAll(sel).forEach((el) => el.remove());
         });
 
-        // Extract title
         let chapterTitle = null;
         for (const sel of titleSels) {
           const el = document.querySelector(sel);
@@ -116,50 +122,72 @@ app.get("/fetch", async (req, res) => {
           }
         }
 
-        // Extract content
         let content = "";
+        let matchedSel = "";
         for (const sel of contentSels) {
           const el = document.querySelector(sel);
           const txt = el ? (el.innerText || el.textContent || "").trim() : "";
-          if (txt.length > 200) {
-            content = txt;
-            break;
-          }
+          if (txt.length > 200) { content = txt; matchedSel = sel; break; }
         }
         if (!content) {
           content = (document.body?.innerText || "").trim();
+          matchedSel = "body";
         }
 
-        // Clean up whitespace
         content = content
           .replace(/\r\n/g, "\n")
           .replace(/\n{3,}/g, "\n\n")
           .replace(/[ \t]{2,}/g, " ")
           .trim();
 
-        return { title: chapterTitle, content };
+        return { title: chapterTitle, content, matchedSel, foundSels, bodyLength: document.body?.innerText?.length };
       },
-      {
-        noiseSels: NOISE_SELECTORS,
-        titleSels: TITLE_SELECTORS,
-        contentSels: CONTENT_SELECTORS,
-      }
+      { noiseSels: NOISE_SELECTORS, titleSels: TITLE_SELECTORS, contentSels: CONTENT_SELECTORS }
     );
 
-    if (!result.content || result.content.length <= 200) {
-      return res.status(422).json({ error: "No content found on page" });
-    }
+    return result;
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
 
+app.get("/fetch", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
+  try {
+    const result = await fetchPage(url);
+    if (!result.content || result.content.length <= 200) {
+      return res.status(422).json({
+        error: "No content found on page",
+        debug: { matchedSel: result.matchedSel, foundSels: result.foundSels, bodyLength: result.bodyLength }
+      });
+    }
     res.json({ title: result.title, content: result.content });
   } catch (err) {
     console.error("Fetch error:", err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    if (page) await page.close().catch(() => {});
   }
 });
 
-// Health check
+// Debug endpoint — call this to see what selectors exist on the page
+app.get("/debug", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
+  try {
+    const result = await fetchPage(url);
+    res.json({
+      matchedSel: result.matchedSel,
+      foundSels: result.foundSels,
+      bodyLength: result.bodyLength,
+      title: result.title,
+      contentLength: result.content?.length,
+      contentPreview: result.content?.slice(0, 300),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running" }));
 
 app.listen(PORT, () => console.log(`Novel proxy listening on port ${PORT}`));
