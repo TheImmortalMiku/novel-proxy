@@ -199,45 +199,90 @@ app.get("/image", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
   try {
-    const https = require("https");
-    const http = require("http");
-    const { URL } = require("url");
-    const parsed = new URL(url);
-    const lib = parsed.protocol === "https:" ? https : http;
-    lib.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": parsed.origin,
+    const b = await getBrowser();
+    const page = await b.newPage();
+    try {
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      });
+      await page.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      );
+      await page.setExtraHTTPHeaders({
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "cross-site",
+      });
+
+      // Use a promise so we properly await the async response buffer read
+      let imageBuffer = null;
+      let contentType = "image/jpeg";
+      const imageCapture = new Promise((resolve) => {
+        page.setRequestInterception(true).then(() => {
+          page.on("request", r => {
+            if (r.resourceType() === "document" || r.resourceType() === "image") r.continue();
+            else r.abort();
+          });
+          page.on("response", async r => {
+            const rUrl = r.url();
+            if (rUrl === url || rUrl.split("?")[0] === url.split("?")[0]) {
+              try {
+                const ct = r.headers()["content-type"] || "";
+                if (ct.startsWith("image/")) {
+                  contentType = ct;
+                  imageBuffer = await r.buffer();
+                  resolve(true);
+                }
+              } catch (_) {}
+            }
+          });
+        });
+      });
+
+      // Navigate directly to the image URL — browser loads it as a real page request
+      await Promise.race([
+        page.goto(url, { waitUntil: "networkidle0", timeout: 20000 }).catch(() => {}),
+        imageCapture,
+      ]);
+
+      // Give response handler a moment to finish if goto resolved first
+      if (!imageBuffer) await new Promise(r => setTimeout(r, 1000));
+
+      if (imageBuffer) {
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        return res.send(imageBuffer);
       }
-    }, (imgRes) => {
-      if (imgRes.statusCode === 301 || imgRes.statusCode === 302) {
-        // follow one redirect
-        const redirectUrl = imgRes.headers.location;
-        const redirectLib = redirectUrl.startsWith("https") ? https : http;
-        redirectLib.get(redirectUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-          }
-        }, (r2) => {
-          res.setHeader("Content-Type", r2.headers["content-type"] || "image/jpeg");
-          r2.pipe(res);
-        }).on("error", (e) => res.status(500).json({ error: e.message }));
-        return;
+
+      // Fallback: fetch() inside the browser context — has the site's cookies/headers
+      const result = await page.evaluate(async (imgUrl) => {
+        try {
+          const r = await fetch(imgUrl, { credentials: "include" });
+          if (!r.ok) return null;
+          const ct = r.headers.get("content-type") || "image/jpeg";
+          const buf = await r.arrayBuffer();
+          return { ct, data: Array.from(new Uint8Array(buf)) };
+        } catch { return null; }
+      }, url);
+
+      if (result) {
+        res.setHeader("Content-Type", result.ct);
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        return res.send(Buffer.from(result.data));
       }
-      if (imgRes.statusCode < 200 || imgRes.statusCode >= 300) {
-        return res.status(imgRes.statusCode).json({ error: "Upstream HTTP " + imgRes.statusCode });
-      }
-      res.setHeader("Content-Type", imgRes.headers["content-type"] || "image/jpeg");
-      imgRes.pipe(res);
-    }).on("error", (e) => res.status(500).json({ error: e.message }));
+
+      res.status(422).json({ error: "Could not retrieve image" });
+    } finally {
+      await page.close().catch(() => {});
+    }
   } catch (err) {
     console.error("Image fetch error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v5" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v6" }));
 
 app.listen(PORT, () => console.log(`Novel proxy listening on port ${PORT}`));
