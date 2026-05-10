@@ -32,12 +32,11 @@ async function getBrowser() {
   return browser;
 }
 
+// Much safer noise selectors — no wildcard class matches that could nuke content
 const NOISE_SELECTORS = [
   "script", "style", "nav", "header", "footer", "aside",
-  "[class*=comment]", "[class*=sidebar]", "[class*=ad]",
-  "[id*=ad]", "[class*=menu]", "[class*=widget]",
-  ".chapter-nav", ".navigation", "[class*=related]",
-  ".rate-bar", ".report", ".chapter-warning",
+  ".chapter-nav", ".navigation", ".rate-bar", ".report", ".chapter-warning",
+  "[class*=comment]", "[class*=sidebar]", "[class*=menu]", "[class*=widget]",
 ];
 
 const CONTENT_SELECTORS = [
@@ -82,10 +81,9 @@ async function fetchPage(url) {
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     });
 
-    // Use networkidle0 to wait for ALL requests to finish (catches lazy-loaded content)
     await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
 
-    // Wait up to 15s for #chapter-container to have real text
+    // Wait for #chapter-container to have real text
     try {
       await page.waitForFunction(
         () => {
@@ -95,7 +93,6 @@ async function fetchPage(url) {
         { timeout: 15000 }
       );
     } catch (_) {
-      // If #chapter-container never fills, try waiting for any content selector
       try {
         await page.waitForFunction(
           (sels) => sels.some((s) => {
@@ -108,22 +105,24 @@ async function fetchPage(url) {
       } catch (_) {}
     }
 
-    // Extra buffer for slow JS rendering
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 2000));
 
     const result = await page.evaluate(
       ({ noiseSels, titleSels, contentSels }) => {
-        // Snapshot all selectors and their text lengths BEFORE removing noise
-        const selectorReport = contentSels.map(s => {
-          const el = document.querySelector(s);
+        // Extract content FIRST before removing anything
+        let content = "";
+        let matchedSel = "";
+        for (const sel of contentSels) {
+          const el = document.querySelector(sel);
           const txt = el ? (el.innerText || el.textContent || "").trim() : "";
-          return { sel: s, len: txt.length, preview: txt.slice(0, 100) };
-        });
+          if (txt.length > 200) { content = txt; matchedSel = sel; break; }
+        }
+        if (!content) {
+          content = (document.body?.innerText || "").trim();
+          matchedSel = "body";
+        }
 
-        noiseSels.forEach((sel) => {
-          document.querySelectorAll(sel).forEach((el) => el.remove());
-        });
-
+        // Extract title before noise removal too
         let chapterTitle = null;
         for (const sel of titleSels) {
           const el = document.querySelector(sel);
@@ -137,18 +136,6 @@ async function fetchPage(url) {
           }
         }
 
-        let content = "";
-        let matchedSel = "";
-        for (const sel of contentSels) {
-          const el = document.querySelector(sel);
-          const txt = el ? (el.innerText || el.textContent || "").trim() : "";
-          if (txt.length > 200) { content = txt; matchedSel = sel; break; }
-        }
-        if (!content) {
-          content = (document.body?.innerText || "").trim();
-          matchedSel = "body";
-        }
-
         content = content
           .replace(/\r\n/g, "\n")
           .replace(/\n{3,}/g, "\n\n")
@@ -160,7 +147,6 @@ async function fetchPage(url) {
           content,
           matchedSel,
           bodyLength: document.body?.innerText?.length,
-          selectorReport,
         };
       },
       { noiseSels: NOISE_SELECTORS, titleSels: TITLE_SELECTORS, contentSels: CONTENT_SELECTORS }
@@ -180,7 +166,7 @@ app.get("/fetch", async (req, res) => {
     if (!result.content || result.content.length <= 200) {
       return res.status(422).json({
         error: "No content found on page",
-        debug: { matchedSel: result.matchedSel, bodyLength: result.bodyLength, selectorReport: result.selectorReport }
+        debug: { matchedSel: result.matchedSel, bodyLength: result.bodyLength }
       });
     }
     res.json({ title: result.title, content: result.content });
@@ -201,13 +187,12 @@ app.get("/debug", async (req, res) => {
       title: result.title,
       contentLength: result.content?.length,
       contentPreview: result.content?.slice(0, 500),
-      selectorReport: result.selectorReport,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v3" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v4" }));
 
 app.listen(PORT, () => console.log(`Novel proxy listening on port ${PORT}`));
