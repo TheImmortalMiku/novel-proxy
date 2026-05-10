@@ -82,27 +82,42 @@ async function fetchPage(url) {
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Use networkidle0 to wait for ALL requests to finish (catches lazy-loaded content)
+    await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
 
-    // Wait for any content selector to have real text
+    // Wait up to 15s for #chapter-container to have real text
     try {
       await page.waitForFunction(
-        (sels) => sels.some((s) => {
-          const el = document.querySelector(s);
+        () => {
+          const el = document.querySelector("#chapter-container");
           return el && (el.innerText || el.textContent || "").trim().length > 200;
-        }),
-        { timeout: 10000 },
-        CONTENT_SELECTORS
+        },
+        { timeout: 15000 }
       );
-    } catch (_) {}
+    } catch (_) {
+      // If #chapter-container never fills, try waiting for any content selector
+      try {
+        await page.waitForFunction(
+          (sels) => sels.some((s) => {
+            const el = document.querySelector(s);
+            return el && (el.innerText || el.textContent || "").trim().length > 200;
+          }),
+          { timeout: 10000 },
+          CONTENT_SELECTORS
+        );
+      } catch (_) {}
+    }
 
-    await new Promise((r) => setTimeout(r, 2000));
+    // Extra buffer for slow JS rendering
+    await new Promise((r) => setTimeout(r, 3000));
 
     const result = await page.evaluate(
       ({ noiseSels, titleSels, contentSels }) => {
-        const foundSels = contentSels.filter(s => {
+        // Snapshot all selectors and their text lengths BEFORE removing noise
+        const selectorReport = contentSels.map(s => {
           const el = document.querySelector(s);
-          return el && (el.innerText || el.textContent || "").trim().length > 50;
+          const txt = el ? (el.innerText || el.textContent || "").trim() : "";
+          return { sel: s, len: txt.length, preview: txt.slice(0, 100) };
         });
 
         noiseSels.forEach((sel) => {
@@ -140,7 +155,13 @@ async function fetchPage(url) {
           .replace(/[ \t]{2,}/g, " ")
           .trim();
 
-        return { title: chapterTitle, content, matchedSel, foundSels, bodyLength: document.body?.innerText?.length };
+        return {
+          title: chapterTitle,
+          content,
+          matchedSel,
+          bodyLength: document.body?.innerText?.length,
+          selectorReport,
+        };
       },
       { noiseSels: NOISE_SELECTORS, titleSels: TITLE_SELECTORS, contentSels: CONTENT_SELECTORS }
     );
@@ -159,7 +180,7 @@ app.get("/fetch", async (req, res) => {
     if (!result.content || result.content.length <= 200) {
       return res.status(422).json({
         error: "No content found on page",
-        debug: { matchedSel: result.matchedSel, foundSels: result.foundSels, bodyLength: result.bodyLength }
+        debug: { matchedSel: result.matchedSel, bodyLength: result.bodyLength, selectorReport: result.selectorReport }
       });
     }
     res.json({ title: result.title, content: result.content });
@@ -169,7 +190,6 @@ app.get("/fetch", async (req, res) => {
   }
 });
 
-// Debug endpoint — call this to see what selectors exist on the page
 app.get("/debug", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
@@ -177,17 +197,17 @@ app.get("/debug", async (req, res) => {
     const result = await fetchPage(url);
     res.json({
       matchedSel: result.matchedSel,
-      foundSels: result.foundSels,
       bodyLength: result.bodyLength,
       title: result.title,
       contentLength: result.content?.length,
-      contentPreview: result.content?.slice(0, 300),
+      contentPreview: result.content?.slice(0, 500),
+      selectorReport: result.selectorReport,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running" }));
+app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v3" }));
 
 app.listen(PORT, () => console.log(`Novel proxy listening on port ${PORT}`));
