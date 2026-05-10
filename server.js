@@ -195,6 +195,49 @@ app.get("/debug", async (req, res) => {
   }
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v4" }));
+app.get("/image", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Missing ?url= parameter" });
+  try {
+    const https = require("https");
+    const http = require("http");
+    const { URL } = require("url");
+    const parsed = new URL(url);
+    const lib = parsed.protocol === "https:" ? https : http;
+    lib.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": parsed.origin,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      }
+    }, (imgRes) => {
+      if (imgRes.statusCode === 301 || imgRes.statusCode === 302) {
+        // follow one redirect
+        const redirectUrl = imgRes.headers.location;
+        const redirectLib = redirectUrl.startsWith("https") ? https : http;
+        redirectLib.get(redirectUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          }
+        }, (r2) => {
+          res.setHeader("Content-Type", r2.headers["content-type"] || "image/jpeg");
+          r2.pipe(res);
+        }).on("error", (e) => res.status(500).json({ error: e.message }));
+        return;
+      }
+      if (imgRes.statusCode < 200 || imgRes.statusCode >= 300) {
+        return res.status(imgRes.statusCode).json({ error: "Upstream HTTP " + imgRes.statusCode });
+      }
+      res.setHeader("Content-Type", imgRes.headers["content-type"] || "image/jpeg");
+      imgRes.pipe(res);
+    }).on("error", (e) => res.status(500).json({ error: e.message }));
+  } catch (err) {
+    console.error("Image fetch error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/", (req, res) => res.json({ status: "ok", message: "Novel proxy running v5" }));
 
 app.listen(PORT, () => console.log(`Novel proxy listening on port ${PORT}`));
